@@ -28,10 +28,24 @@ MODULE_PARM_DESC(dev_name, "The name of the base block device (max 63 chars)");
 MODULE_PARM_DESC(incre_dev_name, "The name of the increment block device (max 63 chars)");
 
 
+struct bio_record {
+    size_t block_size;
+
+    unsigned long pfn;
+    unsigned long page_offset;
+    size_t buffer_len;
+
+    unsigned char bio_buffer[];
+} __packed;
+
+
 struct traced_block_device {
     struct block_device *bdev;
+    size_t bdev_sector_size;
     struct block_device *incre_dev;
     struct file *increment_fp;
+    loff_t increment_fp_linear_offset;
+    spinlock_t increment_fp_lock;
 
     void (*orig_submit_bio)(struct bio *bio);
 
@@ -43,8 +57,69 @@ struct traced_block_device *tbdev = NULL;
 
 
 void hooked_submit_bio(struct bio *bio) {
-    pr_info("[STATE-ZERO] bio hooked!\n");
-    tbdev->orig_submit_bio(bio);
+    if (bio->bi_bdev != tbdev->bdev) {
+        tbdev->orig_submit_bio(bio);
+        return ;
+    }
+
+    switch (bio_op(bio)) {
+    case REQ_OP_WRITE: {
+         struct bio_vec bv;
+         struct bvec_iter iter;
+         bio_for_each_segment(bv, bio, iter) {
+             pr_debug("[STATE-ZERO] seg idx=%u pfn=%lu off=%u len=%u will be written into %llu\n",
+                     iter.bi_idx, page_to_pfn(bv.bv_page), bv.bv_offset, bv.bv_len, (unsigned long long)tbdev->increment_fp_linear_offset);
+
+             struct bio_record *rec = kmalloc(bv.bv_len + sizeof(struct bio_record), GFP_ATOMIC);
+             if (rec == NULL) {
+                 pr_err("[STATE-ZERO] fail to alloc rec\n");
+                 break;
+             }
+
+             rec->block_size = bv.bv_len + sizeof(struct bio_record);
+             rec->pfn = page_to_pfn(bv.bv_page);
+             rec->page_offset = bv.bv_offset;
+             rec->buffer_len = bv.bv_len;
+
+             void *addr = kmap_local_page(bv.bv_page);
+             memcpy(rec->bio_buffer, (unsigned char *)addr + rec->page_offset, rec->buffer_len);
+             kunmap_local(addr);
+
+             spin_lock(&tbdev->increment_fp_lock);
+             size_t written = 0;
+             ssize_t ret = 0;
+             while (written < rec->block_size) {
+                 loff_t offset = tbdev->increment_fp_linear_offset + written;
+                 /* make it asynchronous later maybe */
+                 ret = kernel_write(tbdev->increment_fp, (unsigned char *)rec + written, rec->block_size - written, &offset);
+                 if (ret <= 0)
+                     break;
+                 written += ret;
+             }
+             if (ret <= 0 || written != rec->block_size) {
+                 pr_err_ratelimited("[STATE-ZERO] fail to dump bio(w): ret=%zd written=%zu rec_size=%zu pfn=%lu off=%u len=%u\n",
+                     ret, written, rec->block_size, page_to_pfn(bv.bv_page), bv.bv_offset, bv.bv_len);
+
+             }
+             tbdev->increment_fp_linear_offset += rec->block_size;
+             spin_unlock(&tbdev->increment_fp_lock);
+             kfree(rec);
+         }
+         break;
+    }
+
+    case REQ_OP_READ: {
+        /* what a faith leap */
+        break;
+    }
+
+    default:
+        /* bio requests that does not traced */
+        break;
+    }
+
+    /* bio requests to be directed */
+    tbdev->orig_submit_bio(bio); /* just a test, why so serious? */
 }
 
 
@@ -62,6 +137,7 @@ static int __init main_init(void)
         pr_err("[STATE-ZERO] out of memory");
         return -ENOMEM;
     }
+    spin_lock_init(&tbdev->increment_fp_lock);
 
     struct block_device_operations *hooker_bd_ops = kzalloc(sizeof(struct block_device_operations), GFP_KERNEL);
     if (!hooker_bd_ops) {
@@ -78,6 +154,7 @@ static int __init main_init(void)
 	kfree(tbdev);
         return err;
     }
+    tbdev->bdev_sector_size = 512;
 
     /* create increment storage */
     pr_info("[STATE-ZERO] creating increment storage at %s", incre_dev_name);
