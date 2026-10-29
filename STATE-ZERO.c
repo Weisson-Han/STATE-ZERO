@@ -20,13 +20,19 @@ MODULE_VERSION("0.1");
 
 #define DEV_NAME_MAX_LEN 64
 static char traced_dev_name[DEV_NAME_MAX_LEN] = "default_state_zero";
+static char incre_dev_name[DEV_NAME_MAX_LEN] = "default_state_zero_increment_target";
 
 module_param_string(dev_name, traced_dev_name, DEV_NAME_MAX_LEN, 0644);
-MODULE_PARM_DESC(dev_name, "The name of the STATE-ZERO block device (max 63 chars)");
+module_param_string(incre_dev_name, incre_dev_name, DEV_NAME_MAX_LEN, 0644);
+MODULE_PARM_DESC(dev_name, "The name of the base block device (max 63 chars)");
+MODULE_PARM_DESC(incre_dev_name, "The name of the increment block device (max 63 chars)");
 
 
 struct traced_block_device {
     struct block_device *bdev;
+    struct block_device *incre_dev;
+    struct file *increment_fp;
+
     void (*orig_submit_bio)(struct bio *bio);
 
     struct block_device_operations *orig_bd_ops;
@@ -44,9 +50,10 @@ void hooked_submit_bio(struct bio *bio) {
 
 static int __init main_init(void)
 {
-    if (*traced_dev_name != '/') {
+    if (*traced_dev_name != '/' || *incre_dev_name != '/') {
         pr_err("[STATE-ZERO] invalid parameters dev_name provided!\n");
-        pr_err("[STATE-ZERO] usage: insmod <module name> dev_name=<path to dev needed tracing, eg: /dev/vda1>\n");
+        pr_err("[STATE-ZERO] usage: insmod <module name> dev_name=<path to dev needed tracing> incre_dev_name=<path to local file to record increment>\n");
+        pr_err("[STATE-ZERO] eg: insmod dev_name=/dev/vda1 incre_dev_name=/increment-storage \n");
         return -EINVAL;
     }
 
@@ -72,6 +79,17 @@ static int __init main_init(void)
         return err;
     }
 
+    /* create increment storage */
+    pr_info("[STATE-ZERO] creating increment storage at %s", incre_dev_name);
+    tbdev->increment_fp = filp_open(incre_dev_name, O_RDWR | O_CREAT, 0644);
+    if (IS_ERR(tbdev->increment_fp)) {
+        int err = PTR_ERR(tbdev->increment_fp);
+        pr_err("[STATE-ZERO] failed to open increment storage device %s, err: %ld\n", incre_dev_name, err);
+	kfree(hooker_bd_ops);
+	kfree(tbdev);
+	return err;
+    }
+
     pr_info("[STATE-ZERO] tracking device %s - path %s: %d-%d\n", tbdev->bdev->bd_disk->disk_name, traced_dev_name, tbdev->bdev->bd_start_sect, tbdev->bdev->bd_nr_sectors + tbdev->bdev->bd_start_sect);
 
     memcpy(hooker_bd_ops, tbdev->bdev->bd_disk->fops, sizeof(struct block_device_operations));
@@ -93,6 +111,13 @@ static int __init main_init(void)
 
 static void __exit main_exit(void) {
     pr_info("[STATE-ZERO] restoring bio interface - hooked: 0x%lx -> orig: 0x%lx\n", tbdev->bdev->bd_disk->fops->submit_bio, tbdev->orig_bd_ops->submit_bio);
+
+    int ret = 0;
+    if ((ret = vfs_fsync(tbdev->increment_fp, 0)) < 0) {
+        pr_err("[STATE-ZERO] data sync failed! err code: %d\n", ret);
+    }
+    filp_close(tbdev->increment_fp, NULL);
+    tbdev->increment_fp = NULL;
 
     struct block_device_operations *hooker_bd_ops = tbdev->bdev->bd_disk->fops;
 
