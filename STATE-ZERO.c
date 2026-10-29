@@ -61,6 +61,7 @@ struct traced_block_device {
     bool orig_bd_has_submit_bio;
 };
 
+
 struct traced_block_device *tbdev = NULL;
 struct workqueue_struct *bio_ordered_wq = NULL;
 
@@ -218,13 +219,6 @@ static int __init main_init(void)
 static void __exit main_exit(void) {
     pr_info("[STATE-ZERO] restoring bio interface - hooked: 0x%lx -> orig: 0x%lx\n", tbdev->bdev->bd_disk->fops->submit_bio, tbdev->orig_bd_ops->submit_bio);
 
-    int ret = 0;
-    if ((ret = vfs_fsync(tbdev->increment_fp, 0)) < 0) {
-        pr_err("[STATE-ZERO] data sync failed! err code: %d\n", ret);
-    }
-    filp_close(tbdev->increment_fp, NULL);
-    tbdev->increment_fp = NULL;
-
     struct block_device_operations *hooker_bd_ops = tbdev->bdev->bd_disk->fops;
 
     WRITE_ONCE(tbdev->bdev->bd_has_submit_bio, tbdev->orig_bd_has_submit_bio);
@@ -234,10 +228,22 @@ static void __exit main_exit(void) {
     pr_info("[STATE-ZERO] stopping tracking device %s\n", traced_dev_name);
     blkdev_put(tbdev->bdev, NULL); // hack hack hack as above
 
-    flush_workqueue(bio_ordered_wq);
+
+    /* clean up the workqueue */
     destroy_workqueue(bio_ordered_wq);
 
+    /* clean up hook */
     kfree(hooker_bd_ops);
+
+    /* make sure bio redirection written on disk */
+    int ret = 0;
+    if ((ret = vfs_fsync(tbdev->increment_fp, 0)) < 0) {
+        pr_err("[STATE-ZERO] data sync failed! err code: %d\n", ret);
+    }
+
+    filp_close(tbdev->increment_fp, NULL);
+    tbdev->increment_fp = NULL;
+
     kfree(tbdev);
 }
 
