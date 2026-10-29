@@ -12,6 +12,9 @@
 #include <linux/blkdev.h>
 #include <linux/kallsyms.h>
 
+#include <linux/workqueue.h>
+
+
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Weisson");
 MODULE_DESCRIPTION("A system level snapshottor");
@@ -39,13 +42,18 @@ struct bio_record {
 } __packed;
 
 
+struct bio_write_ctx {
+    struct work_struct work;
+    struct bio_record rec;
+};
+
+
 struct traced_block_device {
     struct block_device *bdev;
     size_t bdev_sector_size;
     struct block_device *incre_dev;
     struct file *increment_fp;
     loff_t increment_fp_linear_offset;
-    spinlock_t increment_fp_lock;
 
     void (*orig_submit_bio)(struct bio *bio);
 
@@ -54,6 +62,31 @@ struct traced_block_device {
 };
 
 struct traced_block_device *tbdev = NULL;
+struct workqueue_struct *bio_ordered_wq = NULL;
+
+
+void handle_bio_write_redirection(struct work_struct *work) {
+    struct bio_write_ctx *ctx = container_of(work, struct bio_write_ctx, work);
+
+    size_t written = 0;
+    ssize_t ret = 0;
+    while (written < ctx->rec.block_size) {
+        loff_t offset = tbdev->increment_fp_linear_offset + written;
+
+        ret = kernel_write(tbdev->increment_fp, (unsigned char *)&ctx->rec + written, ctx->rec.block_size - written, &offset);
+        if (ret <= 0)
+            break;
+        written += ret;
+    }
+    if (ret <= 0 || written != ctx->rec.block_size) {
+        pr_err_ratelimited("[STATE-ZERO] fail to dump bio(w): ret=%zd written=%zu rec_size=%zu pfn=%lu off=%u len=%u\n",
+            ret, written, ctx->rec.block_size, ctx->rec.pfn, ctx->rec.page_offset, ctx->rec.buffer_len);
+
+    }
+    tbdev->increment_fp_linear_offset += ctx->rec.block_size;
+
+    kfree(ctx);
+}
 
 
 void hooked_submit_bio(struct bio *bio) {
@@ -70,40 +103,28 @@ void hooked_submit_bio(struct bio *bio) {
              pr_debug("[STATE-ZERO] seg idx=%u pfn=%lu off=%u len=%u will be written into %llu\n",
                      iter.bi_idx, page_to_pfn(bv.bv_page), bv.bv_offset, bv.bv_len, (unsigned long long)tbdev->increment_fp_linear_offset);
 
-             struct bio_record *rec = kmalloc(bv.bv_len + sizeof(struct bio_record), GFP_ATOMIC);
-             if (rec == NULL) {
+             struct bio_write_ctx *ctx = kmalloc(bv.bv_len + sizeof(struct bio_write_ctx), GFP_ATOMIC);;
+             if (ctx == NULL) {
                  pr_err("[STATE-ZERO] fail to alloc rec\n");
                  break;
              }
 
-             rec->block_size = bv.bv_len + sizeof(struct bio_record);
-             rec->pfn = page_to_pfn(bv.bv_page);
-             rec->page_offset = bv.bv_offset;
-             rec->buffer_len = bv.bv_len;
+             ctx->rec.block_size = bv.bv_len + sizeof(struct bio_record);
+             ctx->rec.pfn = page_to_pfn(bv.bv_page);
+             ctx->rec.page_offset = bv.bv_offset;
+             ctx->rec.buffer_len = bv.bv_len;
 
              void *addr = kmap_local_page(bv.bv_page);
-             memcpy(rec->bio_buffer, (unsigned char *)addr + rec->page_offset, rec->buffer_len);
+             memcpy(ctx->rec.bio_buffer, (unsigned char *)addr + ctx->rec.page_offset, ctx->rec.buffer_len);
              kunmap_local(addr);
 
-             spin_lock(&tbdev->increment_fp_lock);
-             size_t written = 0;
-             ssize_t ret = 0;
-             while (written < rec->block_size) {
-                 loff_t offset = tbdev->increment_fp_linear_offset + written;
-                 /* make it asynchronous later maybe */
-                 ret = kernel_write(tbdev->increment_fp, (unsigned char *)rec + written, rec->block_size - written, &offset);
-                 if (ret <= 0)
-                     break;
-                 written += ret;
-             }
-             if (ret <= 0 || written != rec->block_size) {
-                 pr_err_ratelimited("[STATE-ZERO] fail to dump bio(w): ret=%zd written=%zu rec_size=%zu pfn=%lu off=%u len=%u\n",
-                     ret, written, rec->block_size, page_to_pfn(bv.bv_page), bv.bv_offset, bv.bv_len);
+             INIT_WORK(&ctx->work, handle_bio_write_redirection);
 
+             if (!queue_work(bio_ordered_wq, &ctx->work)) {
+                 pr_err("[STATE-ZERO] failed to insert bio request into working queue\n");
+                 kfree(ctx);
+                 break;
              }
-             tbdev->increment_fp_linear_offset += rec->block_size;
-             spin_unlock(&tbdev->increment_fp_lock);
-             kfree(rec);
          }
          break;
     }
@@ -137,7 +158,6 @@ static int __init main_init(void)
         pr_err("[STATE-ZERO] out of memory");
         return -ENOMEM;
     }
-    spin_lock_init(&tbdev->increment_fp_lock);
 
     struct block_device_operations *hooker_bd_ops = kzalloc(sizeof(struct block_device_operations), GFP_KERNEL);
     if (!hooker_bd_ops) {
@@ -155,6 +175,15 @@ static int __init main_init(void)
         return err;
     }
     tbdev->bdev_sector_size = 512;
+
+    /* prepare workqueue */
+    bio_ordered_wq = alloc_ordered_workqueue("bio_write_wq", 0);
+    if (!bio_ordered_wq) {
+        pr_err("[STATE-ZERO] failed to initialize workqueue\n");
+        kfree(hooker_bd_ops);
+        kfree(tbdev);
+        return -ENOMEM;
+    }
 
     /* create increment storage */
     pr_info("[STATE-ZERO] creating increment storage at %s", incre_dev_name);
@@ -204,6 +233,9 @@ static void __exit main_exit(void) {
 
     pr_info("[STATE-ZERO] stopping tracking device %s\n", traced_dev_name);
     blkdev_put(tbdev->bdev, NULL); // hack hack hack as above
+
+    flush_workqueue(bio_ordered_wq);
+    destroy_workqueue(bio_ordered_wq);
 
     kfree(hooker_bd_ops);
     kfree(tbdev);
