@@ -62,8 +62,18 @@ struct traced_block_device {
 };
 
 
+struct bio_write_workqueue {
+    struct workqueue_struct *bio_ordered_wq;
+    enum {
+        READY,
+        CLEANING_UP,
+    } status;
+    spinlock_t lock;
+};
+
+
 struct traced_block_device *tbdev = NULL;
-struct workqueue_struct *bio_ordered_wq = NULL;
+struct bio_write_workqueue bio_workqueue;
 
 
 void handle_bio_write_redirection(struct work_struct *work) {
@@ -121,11 +131,19 @@ void hooked_submit_bio(struct bio *bio) {
 
              INIT_WORK(&ctx->work, handle_bio_write_redirection);
 
-             if (!queue_work(bio_ordered_wq, &ctx->work)) {
-                 pr_err("[STATE-ZERO] failed to insert bio request into working queue\n");
+             spin_lock(&bio_workqueue.lock);
+             if (bio_workqueue.status != READY) {
+                 spin_unlock(&bio_workqueue.lock);
+                 pr_err("[STATE-ZERO] working queue is being cleaned up, a bio request dropped\n");
                  kfree(ctx);
                  break;
              }
+
+             if (!queue_work(bio_workqueue.bio_ordered_wq, &ctx->work)) {
+                 pr_err("[STATE-ZERO] failed to insert bio request into working queue\n");
+                 kfree(ctx);
+             }
+             spin_unlock(&bio_workqueue.lock);
          }
          break;
     }
@@ -178,13 +196,15 @@ static int __init main_init(void)
     tbdev->bdev_sector_size = 512;
 
     /* prepare workqueue */
-    bio_ordered_wq = alloc_ordered_workqueue("bio_write_wq", 0);
-    if (!bio_ordered_wq) {
+    bio_workqueue.bio_ordered_wq = alloc_ordered_workqueue("bio_write_wq", 0);
+    if (!bio_workqueue.bio_ordered_wq) {
         pr_err("[STATE-ZERO] failed to initialize workqueue\n");
         kfree(hooker_bd_ops);
         kfree(tbdev);
         return -ENOMEM;
     }
+    spin_lock_init(&bio_workqueue.lock);
+    bio_workqueue.status = READY;
 
     /* create increment storage */
     pr_info("[STATE-ZERO] creating increment storage at %s", incre_dev_name);
@@ -230,7 +250,10 @@ static void __exit main_exit(void) {
 
 
     /* clean up the workqueue */
-    destroy_workqueue(bio_ordered_wq);
+    spin_lock(&bio_workqueue.lock);
+    bio_workqueue.status = CLEANING_UP;
+    spin_unlock(&bio_workqueue.lock);
+    destroy_workqueue(bio_workqueue.bio_ordered_wq);
 
     /* clean up hook */
     kfree(hooker_bd_ops);
