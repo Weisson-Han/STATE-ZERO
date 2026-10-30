@@ -8,11 +8,13 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 
-#include <linux/pagemap.h>
-#include <linux/blkdev.h>
 #include <linux/kallsyms.h>
 
 #include <linux/workqueue.h>
+
+#include "trace_block.h"
+#include "bio_redirection.h"
+#include "bio_workqueue.h"
 
 
 MODULE_LICENSE("Dual BSD/GPL");
@@ -30,138 +32,8 @@ module_param_string(incre_dev_name, incre_dev_name, DEV_NAME_MAX_LEN, 0644);
 MODULE_PARM_DESC(dev_name, "The name of the base block device (max 63 chars)");
 MODULE_PARM_DESC(incre_dev_name, "The name of the increment block device (max 63 chars)");
 
-
-struct bio_record {
-    size_t block_size;
-
-    unsigned long pfn;
-    unsigned long page_offset;
-    size_t buffer_len;
-
-    unsigned char bio_buffer[];
-} __packed;
-
-
-struct bio_write_ctx {
-    struct work_struct work;
-    struct bio_record rec;
-};
-
-
-struct traced_block_device {
-    struct block_device *bdev;
-    size_t bdev_sector_size;
-    struct block_device *incre_dev;
-    struct file *increment_fp;
-    loff_t increment_fp_linear_offset;
-
-    void (*orig_submit_bio)(struct bio *bio);
-
-    struct block_device_operations orig_bd_ops;
-    struct block_device_operations *orig_bd_ops_ptr;
-    bool orig_bd_has_submit_bio;
-};
-
-
-struct bio_write_workqueue {
-    struct workqueue_struct *bio_ordered_wq;
-    enum {
-        READY,
-        CLEANING_UP,
-    } status;
-    spinlock_t lock;
-};
-
-
-struct traced_block_device tbdev;
-struct bio_write_workqueue bio_workqueue;
-
-
-void handle_bio_write_redirection(struct work_struct *work) {
-    struct bio_write_ctx *ctx = container_of(work, struct bio_write_ctx, work);
-
-    size_t written = 0;
-    ssize_t ret = 0;
-    while (written < ctx->rec.block_size) {
-        loff_t offset = tbdev.increment_fp_linear_offset + written;
-
-        ret = kernel_write(tbdev.increment_fp, (unsigned char *)&ctx->rec + written, ctx->rec.block_size - written, &offset);
-        if (ret <= 0)
-            break;
-        written += ret;
-    }
-    if (ret <= 0 || written != ctx->rec.block_size) {
-        pr_err_ratelimited("[STATE-ZERO] fail to dump bio(w): ret=%zd written=%zu rec_size=%zu pfn=%lu off=%u len=%u\n",
-            ret, written, ctx->rec.block_size, ctx->rec.pfn, ctx->rec.page_offset, ctx->rec.buffer_len);
-
-    }
-    tbdev.increment_fp_linear_offset += ctx->rec.block_size;
-
-    kfree(ctx);
-}
-
-
-void hooked_submit_bio(struct bio *bio) {
-    if (bio->bi_bdev != tbdev.bdev) {
-        tbdev.orig_submit_bio(bio);
-        return ;
-    }
-
-    switch (bio_op(bio)) {
-    case REQ_OP_WRITE: {
-         struct bio_vec bv;
-         struct bvec_iter iter;
-         bio_for_each_segment(bv, bio, iter) {
-             pr_debug("[STATE-ZERO] seg idx=%u pfn=%lu off=%u len=%u will be written into %llu\n",
-                     iter.bi_idx, page_to_pfn(bv.bv_page), bv.bv_offset, bv.bv_len, (unsigned long long)tbdev.increment_fp_linear_offset);
-
-             struct bio_write_ctx *ctx = kmalloc(bv.bv_len + sizeof(struct bio_write_ctx), GFP_ATOMIC);;
-             if (ctx == NULL) {
-                 pr_err("[STATE-ZERO] fail to alloc rec\n");
-                 break;
-             }
-
-             ctx->rec.block_size = bv.bv_len + sizeof(struct bio_record);
-             ctx->rec.pfn = page_to_pfn(bv.bv_page);
-             ctx->rec.page_offset = bv.bv_offset;
-             ctx->rec.buffer_len = bv.bv_len;
-
-             void *addr = kmap_local_page(bv.bv_page);
-             memcpy(ctx->rec.bio_buffer, (unsigned char *)addr + ctx->rec.page_offset, ctx->rec.buffer_len);
-             kunmap_local(addr);
-
-             INIT_WORK(&ctx->work, handle_bio_write_redirection);
-
-             spin_lock(&bio_workqueue.lock);
-             if (bio_workqueue.status != READY) {
-                 spin_unlock(&bio_workqueue.lock);
-                 pr_err("[STATE-ZERO] working queue is being cleaned up, a bio request dropped\n");
-                 kfree(ctx);
-                 break;
-             }
-
-             if (!queue_work(bio_workqueue.bio_ordered_wq, &ctx->work)) {
-                 pr_err("[STATE-ZERO] failed to insert bio request into working queue\n");
-                 kfree(ctx);
-             }
-             spin_unlock(&bio_workqueue.lock);
-         }
-         break;
-    }
-
-    case REQ_OP_READ: {
-        /* what a faith leap */
-        break;
-    }
-
-    default:
-        /* bio requests that does not traced */
-        break;
-    }
-
-    /* bio requests to be directed */
-    tbdev.orig_submit_bio(bio); /* just a test, why so serious? */
-}
+extern struct traced_block_device tbdev;
+extern struct bio_write_workqueue bio_workqueue;
 
 
 static int __init main_init(void)
@@ -240,7 +112,6 @@ static void __exit main_exit(void) {
     pr_info("[STATE-ZERO] stopping tracking device %s\n", traced_dev_name);
     blkdev_put(tbdev.bdev, NULL); // hack hack hack as above
 
-
     /* clean up the workqueue */
     spin_lock(&bio_workqueue.lock);
     bio_workqueue.status = CLEANING_UP;
@@ -263,3 +134,4 @@ static void __exit main_exit(void) {
 
 module_init(main_init);
 module_exit(main_exit);
+
