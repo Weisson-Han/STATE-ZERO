@@ -2,7 +2,7 @@
 
 obj-m := state-zero.o
 
-state-zero-y := main.o bio_redirection.o globals.o
+state-zero-y := main.o bio_redirection.o globals.o interface.o
 
 KERNEL_DIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
