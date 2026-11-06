@@ -16,6 +16,8 @@
 #include "bio_redirection.h"
 #include "bio_workqueue.h"
 
+#include "interface.h"
+
 
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Weisson");
@@ -26,6 +28,7 @@ MODULE_VERSION("0.1");
 #define DEV_NAME_MAX_LEN 64
 static char traced_dev_name[DEV_NAME_MAX_LEN] = "default_state_zero";
 static char incre_dev_name[DEV_NAME_MAX_LEN] = "default_state_zero_increment_target";
+static spinlock_t sysfs_lock;
 
 module_param_string(dev_name, traced_dev_name, DEV_NAME_MAX_LEN, 0644);
 module_param_string(incre_dev_name, incre_dev_name, DEV_NAME_MAX_LEN, 0644);
@@ -34,6 +37,44 @@ MODULE_PARM_DESC(incre_dev_name, "The name of the increment block device (max 63
 
 extern struct traced_block_device tbdev;
 extern struct bio_write_workqueue bio_workqueue;
+extern struct global_sysfs_ops;
+
+
+int enable(void) {
+    /* install the hooker */
+    tbdev.hooker_bd_ops->submit_bio = hooked_submit_bio;
+    tbdev.orig_submit_bio = tbdev.orig_bd_ops.submit_bio ? tbdev.orig_bd_ops.submit_bio : kallsyms_lookup_name("blk_mq_submit_bio");
+    WRITE_ONCE(tbdev.bdev->bd_disk->fops, tbdev.hooker_bd_ops);
+    tbdev.orig_bd_has_submit_bio = tbdev.bdev->bd_has_submit_bio;
+    smp_wmb(); /* no reading order ensurance, wish you a good luck */
+    WRITE_ONCE(tbdev.bdev->bd_has_submit_bio, true);
+
+    pr_info("[STATE-ZERO] tracing bio interface - origal: 0x%lx -> new: 0x%lx\n", tbdev.orig_bd_ops.submit_bio, tbdev.bdev->bd_disk->fops->submit_bio);
+
+    return 0;
+}
+
+
+int disable(void) {
+    WRITE_ONCE(tbdev.bdev->bd_has_submit_bio, tbdev.orig_bd_has_submit_bio);
+    smp_wmb(); /* no reading order ensurance, wish you a good luck */
+    WRITE_ONCE(tbdev.bdev->bd_disk->fops, tbdev.orig_bd_ops_ptr);
+
+    pr_info("[STATE-ZERO] stopping tracking device %s\n", traced_dev_name);
+
+    return 0;
+}
+
+
+int register_sysfs(void) {
+    spin_lock_init(&sysfs_lock);
+
+    global_sysfs_ops.lock = &sysfs_lock;
+    global_sysfs_ops.enable = enable;
+    global_sysfs_ops.disable = disable;
+
+    return 0;
+}
 
 
 static int __init main_init(void)
@@ -45,8 +86,8 @@ static int __init main_init(void)
         return -EINVAL;
     }
 
-    struct block_device_operations *hooker_bd_ops = kzalloc(sizeof(struct block_device_operations), GFP_KERNEL);
-    if (!hooker_bd_ops) {
+    tbdev.hooker_bd_ops = kzalloc(sizeof(struct block_device_operations), GFP_KERNEL);
+    if (!tbdev.hooker_bd_ops) {
         pr_err("[STATE-ZERO] out of memory");
         return -ENOMEM;
     }
@@ -55,7 +96,7 @@ static int __init main_init(void)
     if (IS_ERR(tbdev.bdev)) {
         int err = PTR_ERR(tbdev.bdev);
         pr_err("[STATE-ZERO] failed to open backing device '%s', error code: %d\n", traced_dev_name, err);
-	kfree(hooker_bd_ops);
+	kfree(tbdev.hooker_bd_ops);
         return err;
     }
     tbdev.bdev_sector_size = 512;
@@ -64,7 +105,7 @@ static int __init main_init(void)
     bio_workqueue.bio_ordered_wq = alloc_ordered_workqueue("bio_write_wq", 0);
     if (!bio_workqueue.bio_ordered_wq) {
         pr_err("[STATE-ZERO] failed to initialize workqueue\n");
-        kfree(hooker_bd_ops);
+        kfree(tbdev.hooker_bd_ops);
         return -ENOMEM;
     }
     spin_lock_init(&bio_workqueue.lock);
@@ -76,40 +117,30 @@ static int __init main_init(void)
     if (IS_ERR(tbdev.increment_fp)) {
         int err = PTR_ERR(tbdev.increment_fp);
         pr_err("[STATE-ZERO] failed to open increment storage device %s, err: %ld\n", incre_dev_name, err);
-	kfree(hooker_bd_ops);
+	kfree(tbdev.hooker_bd_ops);
 	return err;
     }
 
     pr_info("[STATE-ZERO] tracking device %s - path %s: %d-%d\n", tbdev.bdev->bd_disk->disk_name, traced_dev_name, tbdev.bdev->bd_start_sect, tbdev.bdev->bd_nr_sectors + tbdev.bdev->bd_start_sect);
 
-    memcpy(hooker_bd_ops, tbdev.bdev->bd_disk->fops, sizeof(struct block_device_operations));
+    memcpy(tbdev.hooker_bd_ops, tbdev.bdev->bd_disk->fops, sizeof(struct block_device_operations));
     tbdev.orig_bd_ops_ptr = tbdev.bdev->bd_disk->fops;
     tbdev.orig_bd_ops = *tbdev.orig_bd_ops_ptr;
 
-    /* install the hooker */
-    hooker_bd_ops->submit_bio = hooked_submit_bio;
-    tbdev.orig_submit_bio = tbdev.orig_bd_ops.submit_bio ? tbdev.orig_bd_ops.submit_bio : kallsyms_lookup_name("blk_mq_submit_bio");
-    WRITE_ONCE(tbdev.bdev->bd_disk->fops, hooker_bd_ops);
-    tbdev.orig_bd_has_submit_bio = tbdev.bdev->bd_has_submit_bio;
-    smp_wmb(); /* no reading order ensurance, wish you a good luck */
-    WRITE_ONCE(tbdev.bdev->bd_has_submit_bio, true);
-
-    pr_info("[STATE-ZERO] tracing bio interface - origal: 0x%lx -> new: 0x%lx\n", tbdev.orig_bd_ops.submit_bio, tbdev.bdev->bd_disk->fops->submit_bio);
+    register_sysfs();
+    global_sysfs_ops.init();
 
     return 0;
 }
 
 
 static void __exit main_exit(void) {
+    global_sysfs_ops.cleanup();
+
     pr_info("[STATE-ZERO] restoring bio interface - hooked: 0x%lx -> orig: 0x%lx\n", tbdev.bdev->bd_disk->fops->submit_bio, tbdev.orig_bd_ops.submit_bio);
 
-    struct block_device_operations *hooker_bd_ops = tbdev.bdev->bd_disk->fops;
+    tbdev.hooker_bd_ops = tbdev.bdev->bd_disk->fops;
 
-    WRITE_ONCE(tbdev.bdev->bd_has_submit_bio, tbdev.orig_bd_has_submit_bio);
-    smp_wmb(); /* no reading order ensurance, wish you a good luck */
-    WRITE_ONCE(tbdev.bdev->bd_disk->fops, tbdev.orig_bd_ops_ptr);
-
-    pr_info("[STATE-ZERO] stopping tracking device %s\n", traced_dev_name);
     blkdev_put(tbdev.bdev, NULL); // hack hack hack as above
 
     /* clean up the workqueue */
@@ -119,7 +150,7 @@ static void __exit main_exit(void) {
     destroy_workqueue(bio_workqueue.bio_ordered_wq);
 
     /* clean up hook */
-    kfree(hooker_bd_ops);
+    kfree(tbdev.hooker_bd_ops);
 
     /* make sure bio redirection written on disk */
     int ret = 0;

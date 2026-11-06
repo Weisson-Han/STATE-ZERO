@@ -3,8 +3,16 @@
 #ifndef _INTERFACE_H_
 #define _INTERFACE_H_
 
-extern int init_state0_interface(void);
-extern int cleanup_state0_interface(void);
+struct sysfs_interface_operations {
+    int (*get_sysfs_status)(void);
+    int (*enable)(void);
+    int (*disable)(void);
+    int (*init)(void);
+    int (*cleanup)(void);
+    spinlock_t *lock;
+};
+
+extern struct sysfs_interface_operations global_sysfs_ops;
 
 #endif
 

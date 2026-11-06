@@ -15,6 +15,7 @@ struct traced_block_device {
 
     void (*orig_submit_bio)(struct bio *bio);
 
+    struct block_device_operations *hooker_bd_ops;
     struct block_device_operations orig_bd_ops;
     struct block_device_operations *orig_bd_ops_ptr;
     bool orig_bd_has_submit_bio;
